@@ -51,6 +51,7 @@ class Transformers(BaseFnCallModel):
             raise ImportError('Could not import classes from transformers. '
                               'Please install it with `pip install -U transformers`') from e
         
+        self.generate_config = cfg.get("generate_cfg", {})
         self.hf_config = AutoConfig.from_pretrained(cfg['model'])
         arch = self.hf_config.architectures[0]
         if len(self.hf_config.architectures) > 1:
@@ -83,12 +84,18 @@ class Transformers(BaseFnCallModel):
 
         return TextIteratorStreamer(self.tokenizer, timeout=60.0, skip_prompt=True, skip_special_tokens=True)
 
-    def _get_inputs(self, messages: List[Message]):
+    def _get_inputs(self, messages: List[Message], generate_cfg: Optional[Dict] = None):
         import torch
+
+        generate_config = generate_cfg or self.generate_config
+        # ugly: do a second deep copy in case generate_cfg is None, and self.generate_config is used instead.
+        # this would avoid self.generate_config from being altered later.
+        generate_config = copy.deepcopy(generate_config)
         
         messages_plain = [message.model_dump() for message in messages]
+        enable_thinking = generate_config.get("enable_thinking", False)
         if not self.support_multimodal_input:
-            input_ids = self.tokenizer.apply_chat_template(messages_plain, add_generation_prompt=True, return_tensors='pt')
+            input_ids = self.tokenizer.apply_chat_template(messages_plain, add_generation_prompt=True, return_tensors='pt', enable_thinking=enable_thinking)
             inputs = dict(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
         else:
             for message in messages_plain:
@@ -104,7 +111,7 @@ class Transformers(BaseFnCallModel):
                     if content_item['type'] in (AUDIO,):
                         audio_paths.append(content_item[AUDIO])
             
-            prompt = self.processor.apply_chat_template(messages_plain, add_generation_prompt=True, tokenize=False)
+            prompt = self.processor.apply_chat_template(messages_plain, add_generation_prompt=True, tokenize=False, enable_thinking=enable_thinking)
             processor_kwargs = {'text': prompt}
             
             if has_vision:
@@ -139,7 +146,7 @@ class Transformers(BaseFnCallModel):
         generate_cfg: dict,
     ) -> Iterator[List[Message]]:
         generate_cfg = copy.deepcopy(generate_cfg)
-        inputs = self._get_inputs(messages)
+        inputs = self._get_inputs(messages, generate_cfg)
         streamer = self._get_streamer()
 
         generate_cfg.update(inputs)
@@ -152,6 +159,9 @@ class Transformers(BaseFnCallModel):
             from transformers import set_seed
             set_seed(generate_cfg['seed'])
             del generate_cfg['seed']
+        
+        if 'enable_thinking' in generate_cfg:
+            del generate_cfg['enable_thinking']
 
         def generate_and_signal_complete():
             self.hf_model.generate(**generate_cfg)
@@ -173,7 +183,7 @@ class Transformers(BaseFnCallModel):
     ) -> List[Message]:
         generate_cfg = copy.deepcopy(generate_cfg)
 
-        inputs = self._get_inputs(messages)
+        inputs = self._get_inputs(messages, generate_cfg)
         generate_cfg.update(inputs)
         generate_cfg.update(dict(
             max_new_tokens=generate_cfg.get('max_new_tokens', 2048)
